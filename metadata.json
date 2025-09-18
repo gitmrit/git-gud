@@ -1,0 +1,5 @@
+{
+  "name": "Git Gud: Interactive Git Practice",
+  "description": "An interactive web application designed to help students learn and practice Git commands in a safe, simulated environment, with an AI assistant to provide explanations and generate new challenges.",
+  "requestFramePermissions": []
+}
