@@ -1,13 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { CommandResult } from '../services/gitSimulator';
 
 interface TerminalProps {
-  onCommand: (command: string) => CommandResult;
+  onCommand: (command: string) => void;
   osMode: 'unix' | 'windows';
+  history: { command: string; output: string }[];
 }
 
-const Terminal: React.FC<TerminalProps> = ({ onCommand, osMode }) => {
-  const [history, setHistory] = useState<{ command: string; output: string }[]>([]);
+const Terminal: React.FC<TerminalProps> = ({ onCommand, osMode, history }) => {
   const [input, setInput] = useState('');
   const endOfTerminalRef = useRef<null | HTMLDivElement>(null);
   const inputRef = useRef<null | HTMLInputElement>(null);
@@ -16,13 +15,7 @@ const Terminal: React.FC<TerminalProps> = ({ onCommand, osMode }) => {
     e.preventDefault();
     if (!input.trim()) return;
 
-    const { output, action } = onCommand(input.trim());
-
-    if (action === 'clear') {
-      setHistory([]);
-    } else {
-      setHistory(prev => [...prev, { command: input, output }]);
-    }
+    onCommand(input.trim());
     
     setInput('');
   };
@@ -30,11 +23,6 @@ const Terminal: React.FC<TerminalProps> = ({ onCommand, osMode }) => {
   useEffect(() => {
     endOfTerminalRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [history]);
-  
-  useEffect(() => {
-    // Clear history on OS change
-    setHistory([]);
-  }, [osMode]);
 
   const focusInput = () => {
     inputRef.current?.focus();

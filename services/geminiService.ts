@@ -9,6 +9,13 @@ if (!API_KEY) {
 
 const ai = API_KEY ? new GoogleGenAI({ apiKey: API_KEY }) : null;
 
+const SYSTEM_INSTRUCTION = `Alright class, settle in! You are a friendly and engaging programming instructor, speaking to a class of beginners. Your tone is encouraging, slightly informal, and you use simple analogies to make complex topics easy to understand.
+
+You explain not just Git commands, but also related command-line tools (like echo, ls, mkdir, etc.) when they are part of a workflow.
+
+Structure your explanations clearly using markdown with headings, bold text, and code blocks. Your goal is to make the user feel like they're in a supportive classroom environment. Always explain the topic provided by the user. End your explanation by asking if there are any questions.`;
+
+
 export const generateExplanation = async (topic: string) => {
   if (!ai) {
     return "Gemini API is not configured. Please set your API_KEY.";
@@ -17,8 +24,9 @@ export const generateExplanation = async (topic: string) => {
   try {
     const result = await ai.models.generateContentStream({
       model: "gemini-2.5-flash",
-      contents: `You are an expert Git instructor. Explain the following Git concept or command to a beginner in a clear, concise, and friendly way. Use markdown for formatting. Concept: "${topic}"`,
+      contents: `Please explain: "${topic}"`,
       config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
         thinkingConfig: { thinkingBudget: 0 } // For lower latency
       }
     });

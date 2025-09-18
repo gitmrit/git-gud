@@ -46,12 +46,19 @@ export class GitSimulator {
       stagingArea: {},
       workingDirectory: {},
       directories: [],
+      stash: [],
+      tags: {},
+      mergeInProgress: null,
     };
   }
   
   getState(): RepositoryState {
     // Deep copy to prevent mutation of internal state
     return JSON.parse(JSON.stringify(this.repoState));
+  }
+
+  public setState(state: RepositoryState): void {
+    this.repoState = JSON.parse(JSON.stringify(state));
   }
 
   private pathExists(path: string): boolean {
@@ -77,7 +84,21 @@ export class GitSimulator {
     const [cmd, ...args] = parts;
 
     if (cmd === '') return { output: '', repoState: this.getState() };
-    
+
+    // Handle user trying to resolve merge conflict by editing a file
+    if (this.repoState.mergeInProgress && (cmd === 'echo' || cmd === 'echo.')) {
+        const result = this.osMode === 'unix' ? this.handleUnixShell(cmd, args) : this.handleWindowsShell(cmd, args);
+        const fileName = args[args.length - 1];
+        if(this.repoState.mergeInProgress.conflictingFiles.includes(fileName)) {
+            const fileContent = this.repoState.workingDirectory[fileName].content;
+            if(!fileContent.includes('<<<<<<<') && !fileContent.includes('>>>>>>>')) {
+                // User has removed conflict markers (simulated)
+                this.repoState.mergeInProgress.conflictingFiles = this.repoState.mergeInProgress.conflictingFiles.filter(f => f !== fileName);
+            }
+        }
+        return result;
+    }
+
     if (cmd !== 'git') {
       return this.osMode === 'unix' ? this.handleUnixShell(cmd, args) : this.handleWindowsShell(cmd, args);
     }
@@ -87,18 +108,20 @@ export class GitSimulator {
     const gitArgs = args.slice(1);
 
     switch (gitCmd) {
-      case 'init':
-        return this.init();
-      case 'add':
-        return this.add(gitArgs);
-      case 'commit':
-        return this.commit(gitArgs);
-      case 'branch':
-        return this.branch(gitArgs);
-      case 'checkout':
-        return this.checkout(gitArgs);
-      case 'log':
-        return this.log();
+      case 'init': return this.init();
+      case 'add': return this.add(gitArgs);
+      case 'commit': return this.commit(gitArgs);
+      case 'branch': return this.branch(gitArgs);
+      case 'checkout': return this.checkout(gitArgs);
+      case 'log': return this.log(gitArgs);
+      case 'status': return this.status();
+      case 'merge': return this.merge(gitArgs);
+      case 'stash': return this.stash(gitArgs);
+      case 'revert': return this.revert(gitArgs);
+      case 'tag': return this.tag(gitArgs);
+      case 'clean': return this.clean(gitArgs);
+      case 'rebase': return this.rebase(gitArgs);
+      case 'cherry-pick': return this.cherryPick(gitArgs);
       default:
         return { output: `git: '${gitCmd}' is not a git command. See 'git --help'.`, repoState: this.getState() };
     }
@@ -164,7 +187,7 @@ export class GitSimulator {
           return { output: '', repoState: this.getState() };
       }
       
-      if (isEchoDotWin) return { output: 'ECHO is on.', repoState: this.getState() };
+      if (isEchoDotWin) return { output: '', repoState: this.getState() };
       return { output: args.join(' '), repoState: this.getState() };
   }
 
@@ -450,7 +473,7 @@ export class GitSimulator {
         filesToAdd.push(pathSpec);
     } else if (this.isDirectory(pathSpec)) {
         filesToAdd = Object.keys(this.repoState.workingDirectory).filter(f => f.startsWith(pathSpec + '/'));
-    } else if (pathSpec === '.') {
+    } else if (pathSpec === '.' || pathSpec === '*') {
         filesToAdd = Object.keys(this.repoState.workingDirectory);
     }
 
@@ -460,31 +483,62 @@ export class GitSimulator {
 
     filesToAdd.forEach(file => {
         this.repoState.stagingArea[file] = { ...this.repoState.workingDirectory[file] };
+        if(this.repoState.mergeInProgress?.conflictingFiles.includes(file)) {
+            this.repoState.mergeInProgress.conflictingFiles = this.repoState.mergeInProgress.conflictingFiles.filter(f => f !== file);
+        }
     });
     
     return { output: '', repoState: this.getState() };
   }
   
   private commit(args: string[]): CommandResult {
-    if (Object.keys(this.repoState.stagingArea).length === 0) {
-      return { output: 'On branch main\nYour branch is up to date with \'origin/main\'.\n\nnothing to commit, working tree clean', repoState: this.getState() };
+    if (this.repoState.mergeInProgress && this.repoState.mergeInProgress.conflictingFiles.length > 0) {
+        return { output: 'error: you need to resolve your current index first', repoState: this.getState() };
     }
     
-    const mIndex = args.indexOf('-m');
+    if (Object.keys(this.repoState.stagingArea).length === 0 && !this.repoState.mergeInProgress) {
+      return { output: 'On branch main\nYour branch is up to date with \'origin/main\'.\n\nnothing to commit, working tree clean', repoState: this.getState() };
+    }
+
+    const amend = args.includes('--amend');
+    const noEdit = args.includes('--no-edit');
+    
     let message = 'Unnamed commit';
+    const mIndex = args.indexOf('-m');
     if (mIndex !== -1 && args[mIndex + 1]) {
-        // Handle message in quotes
         const messageParts = [];
         for (let i = mIndex + 1; i < args.length; i++) {
-            messageParts.push(args[i]);
+            const arg = args[i];
+            if (arg === '--amend' || arg === '--no-edit') break;
+            messageParts.push(arg);
         }
         message = messageParts.join(' ').replace(/"/g, '');
     }
 
-    const parentId = this.repoState.branches[this.repoState.HEAD];
-    const parentCommit = this.repoState.commits[parentId];
+    let parentIds: string[];
+    let parentCommitFiles: Record<string, FileState> = {};
+    
+    if (amend) {
+        const headCommit = this.repoState.commits[this.repoState.branches[this.repoState.HEAD]];
+        parentIds = headCommit.parents;
+        parentCommitFiles = this.repoState.commits[parentIds[0]]?.files || {};
+        if (!noEdit && mIndex === -1) message = headCommit.message; // Keep old message if no new one
+    } else if (this.repoState.mergeInProgress) {
+        const currentBranchId = this.repoState.branches[this.repoState.HEAD];
+        const mergingBranchId = this.repoState.branches[this.repoState.mergeInProgress.branchToMerge];
+        parentIds = [currentBranchId, mergingBranchId];
+        // Parent files are merged already
+        parentCommitFiles = this.repoState.commits[currentBranchId].files;
+        if(mIndex === -1) {
+            message = `Merge branch '${this.repoState.mergeInProgress.branchToMerge}' into ${this.repoState.HEAD}`;
+        }
+    } else {
+        const parentId = this.repoState.branches[this.repoState.HEAD];
+        parentIds = [parentId];
+        parentCommitFiles = this.repoState.commits[parentId]?.files || {};
+    }
 
-    const newFiles = { ...parentCommit.files };
+    const newFiles = { ...parentCommitFiles };
     // Apply staged changes
     for (const path in this.repoState.stagingArea) {
         const stageEntry = this.repoState.stagingArea[path];
@@ -495,13 +549,13 @@ export class GitSimulator {
         }
     }
 
-    const commitContent = `${message}${parentId}${JSON.stringify(newFiles)}${Date.now()}`;
+    const commitContent = `${message}${parentIds.join(',')}${JSON.stringify(newFiles)}${Date.now()}`;
     const newCommitId = simpleHash(commitContent);
 
     const newCommit: Commit = {
       id: newCommitId,
       message,
-      parents: [parentId],
+      parents: parentIds,
       files: newFiles,
       timestamp: Date.now()
     };
@@ -509,6 +563,7 @@ export class GitSimulator {
     this.repoState.commits[newCommitId] = newCommit;
     this.repoState.branches[this.repoState.HEAD] = newCommitId;
     this.repoState.stagingArea = {};
+    this.repoState.mergeInProgress = null;
 
     return { output: `[${this.repoState.HEAD} ${newCommitId}] ${message}`, repoState: this.getState() };
   }
@@ -530,6 +585,18 @@ export class GitSimulator {
     if (!branchName) {
         return { output: 'fatal: missing branch name', repoState: this.getState() };
     }
+    const createBranch = args.includes('-b');
+    
+    if (createBranch) {
+        const newBranchName = args[args.indexOf('-b') + 1];
+        if (!newBranchName) return { output: 'fatal: missing branch name', repoState: this.getState() };
+        if (this.repoState.branches[newBranchName]) return { output: `fatal: A branch named '${newBranchName}' already exists.`, repoState: this.getState() };
+        
+        this.repoState.branches[newBranchName] = this.repoState.branches[this.repoState.HEAD];
+        this.repoState.HEAD = newBranchName;
+        return { output: `Switched to a new branch '${newBranchName}'`, repoState: this.getState() };
+    }
+    
     if (!this.repoState.branches[branchName]) {
         return { output: `error: pathspec '${branchName}' did not match any file(s) known to git`, repoState: this.getState() };
     }
@@ -554,13 +621,24 @@ export class GitSimulator {
     return { output: `Switched to branch '${branchName}'`, repoState: this.getState() };
   }
   
-  private log(): CommandResult {
+  private log(args: string[]): CommandResult {
+      let branchToLog = this.repoState.HEAD;
+      if (args.length > 0 && !args[0].startsWith('--')) {
+          if (this.repoState.branches[args[0]]) {
+            branchToLog = args[0];
+          } else {
+             return { output: `fatal: ambiguous argument '${args[0]}': unknown revision or path not in the working tree.`, repoState: this.getState() };
+          }
+      }
+      
       let output = '';
-      let currentId = this.repoState.branches[this.repoState.HEAD];
+      let currentId = this.repoState.branches[branchToLog];
       while(currentId && currentId !== 'root') {
           const commit = this.repoState.commits[currentId];
           if(!commit) break;
           output += `commit ${commit.id}\n`;
+          const tags = Object.entries(this.repoState.tags).filter(([_, commitId]) => commitId === commit.id).map(([tagName, _]) => `tag: ${tagName}`);
+          if (tags.length > 0) output += `${tags.join(', ')}\n`;
           output += `Author: Git Gud <git.gud@example.com>\n`;
           output += `Date:   ${new Date(commit.timestamp).toString()}\n\n`;
           output += `    ${commit.message}\n\n`;
@@ -568,4 +646,274 @@ export class GitSimulator {
       }
       return { output: output.trim(), repoState: this.getState() };
   }
+
+  private status(): CommandResult {
+    if (!this.repoState.HEAD) {
+        return { output: 'fatal: not a git repository (or any of the parent directories): .git', repoState: this.getState() };
+    }
+
+    if(this.repoState.mergeInProgress) {
+        let output = `On branch ${this.repoState.HEAD}\nYou have unmerged paths.\n  (fix conflicts and run "git commit")\n\nUnmerged paths:\n  (use "git add <file>..." to mark resolution)\n`;
+        output += this.repoState.mergeInProgress.conflictingFiles.map(f => `\tboth modified: ${f}`).join('\n');
+        return { output, repoState: this.getState() };
+    }
+
+    const headCommitId = this.repoState.branches[this.repoState.HEAD];
+    const headCommit = this.repoState.commits[headCommitId];
+    const committedFiles = headCommit?.files || {};
+    
+    const stagedFiles = this.repoState.stagingArea;
+    const wdFiles = this.repoState.workingDirectory;
+
+    const stagedChanges: string[] = [];
+    const notStagedChanges: string[] = [];
+    const untracked: string[] = [];
+
+    // Staged changes (compare staging area to HEAD)
+    for (const file in stagedFiles) {
+        if (!committedFiles[file]) {
+            stagedChanges.push(`\tnew file:   ${file}`);
+        } else if (committedFiles[file].content !== (stagedFiles[file] as FileState).content) {
+            stagedChanges.push(`\tmodified:   ${file}`);
+        }
+    }
+
+    // All known files (committed or staged)
+    const trackedFiles = new Set([...Object.keys(committedFiles), ...Object.keys(stagedFiles)]);
+
+    for (const file in wdFiles) {
+        if (!trackedFiles.has(file)) {
+            untracked.push(`\t${file}`);
+        } else {
+            // File is tracked, check for modifications
+            const stagedContent = stagedFiles[file] && !('status' in stagedFiles[file]) ? (stagedFiles[file] as FileState).content : null;
+            const committedContent = committedFiles[file]?.content;
+            const currentContent = wdFiles[file].content;
+            
+            // Compare WD to staging area if it exists there
+            if (stagedContent !== null && stagedContent !== currentContent) {
+                 notStagedChanges.push(`\tmodified:   ${file}`);
+            } 
+            // Else, if not staged, compare WD to commit
+            else if (stagedContent === null && committedContent !== currentContent) {
+                notStagedChanges.push(`\tmodified:   ${file}`);
+            }
+        }
+    }
+
+    let output = `On branch ${this.repoState.HEAD}\n`;
+
+    if (stagedChanges.length === 0 && notStagedChanges.length === 0 && untracked.length === 0) {
+        output += '\nnothing to commit, working tree clean';
+        return { output, repoState: this.getState() };
+    }
+
+    if (stagedChanges.length > 0) {
+        output += '\nChanges to be committed:\n';
+        output += '  (use "git restore --staged <file>..." to unstage)\n';
+        output += stagedChanges.join('\n') + '\n';
+    }
+
+    if (notStagedChanges.length > 0) {
+        output += '\nChanges not staged for commit:\n';
+        output += '  (use "git add <file>..." to update what will be committed)\n';
+        output += '  (use "git restore <file>..." to discard changes in working directory)\n';
+        output += notStagedChanges.join('\n') + '\n';
+    }
+
+    if (untracked.length > 0) {
+        output += '\nUntracked files:\n';
+        output += '  (use "git add <file>..." to include in what will be committed)\n';
+        output += untracked.join('\n') + '\n';
+    }
+
+    return { output: output.trim(), repoState: this.getState() };
+  }
+  
+  private merge(args: string[]): CommandResult {
+      const branchToMerge = args[0];
+      if (!branchToMerge) return { output: 'fatal: No branch specified.', repoState: this.getState() };
+      if (!this.repoState.branches[branchToMerge]) return { output: `fatal: '${branchToMerge}' does not point to a commit`, repoState: this.getState() };
+      if (branchToMerge === this.repoState.HEAD) return { output: 'Already up to date.', repoState: this.getState() };
+      
+      const headCommit = this.repoState.commits[this.repoState.branches[this.repoState.HEAD]];
+      const mergeCommit = this.repoState.commits[this.repoState.branches[branchToMerge]];
+
+      const conflictingFiles: string[] = [];
+      const mergedFiles = { ...headCommit.files };
+      
+      for(const file in mergeCommit.files) {
+          if (!headCommit.files[file]) {
+              mergedFiles[file] = mergeCommit.files[file];
+          } else if (headCommit.files[file].content !== mergeCommit.files[file].content) {
+              conflictingFiles.push(file);
+          }
+      }
+
+      if (conflictingFiles.length > 0) {
+          this.repoState.mergeInProgress = { branchToMerge, conflictingFiles };
+          for (const file of conflictingFiles) {
+              const headContent = headCommit.files[file].content;
+              const mergeContent = mergeCommit.files[file].content;
+              this.repoState.workingDirectory[file].content = `<<<<<<< HEAD\n${headContent}\n=======\n${mergeContent}\n>>>>>>> ${branchToMerge}`;
+          }
+          return { output: `Auto-merging ${conflictingFiles.join(' ')}\nCONFLICT (content): Merge conflict in ${conflictingFiles.join(' ')}\nAutomatic merge failed; fix conflicts and then commit the result.`, repoState: this.getState() };
+      }
+      
+      // No conflicts, create merge commit
+      this.repoState.workingDirectory = { ...this.repoState.workingDirectory, ...mergedFiles };
+      Object.keys(mergedFiles).forEach(file => this.repoState.stagingArea[file] = mergedFiles[file]);
+      
+      const commitResult = this.commit(['-m', `Merge branch '${branchToMerge}'`]);
+      // state is already set by commit, just return its output
+      return commitResult;
+  }
+
+  private stash(args: string[]): CommandResult {
+      const command = args[0] || 'push';
+      if (command === 'push' || !args[0]) {
+          const stagedFiles = this.repoState.stagingArea;
+          const headCommit = this.repoState.commits[this.repoState.branches[this.repoState.HEAD]];
+          const modifiedFiles: Record<string, FileState> = {};
+          
+          Object.keys(this.repoState.workingDirectory).forEach(file => {
+              const wdContent = this.repoState.workingDirectory[file].content;
+              const headContent = headCommit.files[file]?.content;
+              if (wdContent !== headContent) {
+                  modifiedFiles[file] = this.repoState.workingDirectory[file];
+              }
+          });
+          
+          if(Object.keys(modifiedFiles).length === 0) return { output: 'No local changes to save', repoState: this.getState() };
+          
+          this.repoState.stash.push({ message: `WIP on ${this.repoState.HEAD}`, files: modifiedFiles });
+          // Revert working directory to HEAD
+          this.repoState.workingDirectory = { ...headCommit.files };
+          this.repoState.stagingArea = {};
+
+          return { output: `Saved working directory and index state WIP on ${this.repoState.HEAD}`, repoState: this.getState() };
+      }
+      
+      if (command === 'pop' || command === 'apply') {
+          if (this.repoState.stash.length === 0) return { output: 'No stash entries found.', repoState: this.getState() };
+          const stashToApply = this.repoState.stash[this.repoState.stash.length - 1];
+          
+          // Simple apply: overwrite working directory. Does not handle merge conflicts.
+          for (const file in stashToApply.files) {
+              this.repoState.workingDirectory[file] = stashToApply.files[file];
+          }
+          
+          if (command === 'pop') {
+              this.repoState.stash.pop();
+          }
+          return { output: 'On branch main\nChanges not staged for commit:\n  (use "git add <file>..." to update what will be committed)\n\nnothing added to commit but untracked files present', repoState: this.getState() };
+      }
+      
+      return { output: `git: '${command}' is not a git command.`, repoState: this.getState() };
+  }
+
+  private revert(args: string[]): CommandResult {
+      const commitToRevertRef = args[0] || 'HEAD';
+      if(commitToRevertRef !== 'HEAD') return { output: `fatal: Invalid revision range "${commitToRevertRef}"`, repoState: this.getState() };
+      
+      const headCommit = this.repoState.commits[this.repoState.branches[this.repoState.HEAD]];
+      const parentCommit = this.repoState.commits[headCommit.parents[0]];
+      
+      // Simple revert: stage the opposite of the last commit
+      this.repoState.stagingArea = {};
+      for(const file in parentCommit.files) {
+          this.repoState.stagingArea[file] = parentCommit.files[file];
+      }
+       for(const file in headCommit.files) {
+          if(!parentCommit.files[file]) {
+              this.repoState.stagingArea[file] = { status: 'deleted' };
+          }
+      }
+      this.checkout([]); // Discard WD changes
+      
+      const commitResult = this.commit(['-m', `Revert "${headCommit.message}"`]);
+      return commitResult;
+  }
+
+  private tag(args: string[]): CommandResult {
+      const tagName = args[0];
+      if(!tagName) { // list tags
+          return { output: Object.keys(this.repoState.tags).join('\n'), repoState: this.getState() };
+      }
+      this.repoState.tags[tagName] = this.repoState.branches[this.repoState.HEAD];
+      return { output: '', repoState: this.getState() };
+  }
+
+  private clean(args: string[]): CommandResult {
+      if(!args.includes('-f')) return { output: 'fatal: -f, --force required', repoState: this.getState() };
+      const headCommit = this.repoState.commits[this.repoState.branches[this.repoState.HEAD]];
+      
+      for(const file in this.repoState.workingDirectory) {
+          if(!headCommit.files[file]) {
+              delete this.repoState.workingDirectory[file];
+          }
+      }
+      return { output: '', repoState: this.getState() };
+  }
+
+  private rebase(args: string[]): CommandResult {
+      const baseBranch = args[0];
+      if(!baseBranch) return { output: 'fatal: needed a single revision', repoState: this.getState() };
+      if(!this.repoState.branches[baseBranch]) return { output: `fatal: invalid upstream '${baseBranch}'`, repoState: this.getState() };
+
+      const currentBranch = this.repoState.HEAD;
+      let baseCommitId = this.repoState.branches[baseBranch];
+      let currentCommitId = this.repoState.branches[currentBranch];
+      
+      const commitsToReplay: Commit[] = [];
+      // Find commits in current branch that are not in base branch
+      while(currentCommitId && currentCommitId !== 'root') {
+          const c = this.repoState.commits[currentCommitId];
+          // Simplistic check: assumes linear history for finding common ancestor
+          if(c.parents.includes(baseCommitId)) break;
+          commitsToReplay.unshift(c);
+          currentCommitId = c.parents[0];
+      }
+      
+      // Replay commits on top of baseBranch tip
+      for(const commit of commitsToReplay) {
+          const newFiles = { ...this.repoState.commits[baseCommitId].files, ...commit.files };
+          const commitContent = `${commit.message}${baseCommitId}${JSON.stringify(newFiles)}${Date.now()}`;
+          const newCommitId = simpleHash(commitContent);
+          const newCommit: Commit = {
+              id: newCommitId,
+              message: commit.message,
+              parents: [baseCommitId],
+              files: newFiles,
+              timestamp: Date.now()
+          };
+          this.repoState.commits[newCommitId] = newCommit;
+          baseCommitId = newCommitId;
+      }
+      
+      this.repoState.branches[currentBranch] = baseCommitId;
+      this.checkout([currentBranch]);
+
+      return { output: `Successfully rebased and updated refs/heads/${currentBranch}.`, repoState: this.getState() };
+  }
+
+  private cherryPick(args: string[]): CommandResult {
+      const commitHash = args[0];
+      if(!commitHash) return { output: 'fatal: empty commit set passed', repoState: this.getState() };
+      
+      const commitToPick = Object.values(this.repoState.commits).find(c => c.id.startsWith(commitHash));
+      if(!commitToPick) return { output: `fatal: bad object ${commitHash}`, repoState: this.getState() };
+
+      // Apply changes from the picked commit to the staging area
+      const parentOfPick = this.repoState.commits[commitToPick.parents[0]];
+      for(const file in commitToPick.files) {
+          if(!parentOfPick.files[file] || parentOfPick.files[file].content !== commitToPick.files[file].content) {
+              this.repoState.stagingArea[file] = commitToPick.files[file];
+          }
+      }
+
+      this.commit(['-m', commitToPick.message]);
+      return { output: `[${this.repoState.HEAD} ${this.repoState.branches[this.repoState.HEAD]}] ${commitToPick.message}`, repoState: this.getState() };
+  }
+
 }

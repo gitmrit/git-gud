@@ -11,7 +11,7 @@ const FileExplorerPanel: React.FC<FileExplorerPanelProps> = ({ repoState }) => {
   const files = Object.keys(repoState.workingDirectory);
 
   return (
-    <div className="p-4 mt-4 border-t-2 border-pr-border/20">
+    <div className="p-4">
       <h3 className="text-sm font-bold tracking-widest uppercase text-pr-text/60 mb-3">Explorer</h3>
       <div className="space-y-1">
         <div className="flex items-center gap-2">

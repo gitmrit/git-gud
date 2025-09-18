@@ -19,6 +19,12 @@ export interface RepositoryState {
   stagingArea: Record<string, FileState | { status: 'deleted' }>; // filename -> file state or deleted status
   workingDirectory: Record<string, FileState>;
   directories: string[];
+  stash: { message: string, files: Record<string, FileState> }[];
+  tags: Record<string, string>; // tag name -> commit id
+  mergeInProgress: {
+      branchToMerge: string;
+      conflictingFiles: string[];
+  } | null;
 }
 
 export interface Command {
@@ -26,7 +32,7 @@ export interface Command {
   description: string;
 }
 
-export interface Scenario {
+export interface Exercise {
   id: string;
   title: string;
   description: string | { unix: string; windows: string };
@@ -35,4 +41,11 @@ export interface Scenario {
     windows: Command[];
   };
   goal: (repoState: RepositoryState) => boolean;
+}
+
+export interface Experiment {
+  id: string;
+  title: string;
+  description: string;
+  exercises: Exercise[];
 }
